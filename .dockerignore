@@ -1,0 +1,11 @@
+.git
+.gitignore
+.github
+.idea
+.vscode
+target/*
+!target/java-demo-app.jar
+*.log
+.env
+.env.*
+!.env.example
