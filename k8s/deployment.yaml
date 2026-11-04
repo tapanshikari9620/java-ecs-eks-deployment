@@ -1,0 +1,20 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: java-demo-app
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: java-demo-app
+  template:
+    metadata:
+      labels:
+        app: java-demo-app
+    spec:
+      containers:
+        - name: java-demo-app
+          image: 035338518756.dkr.ecr.us-east-1.amazonaws.com/java-demo-app:6
+          ports:
+            - containerPort: 8080
