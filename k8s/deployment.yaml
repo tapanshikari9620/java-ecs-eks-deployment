@@ -15,6 +15,6 @@ spec:
     spec:
       containers:
         - name: java-demo-app
-          image: 035338518756.dkr.ecr.us-east-1.amazonaws.com/java-demo-app:6
+          image: YOUR_ECR_IMAGE
           ports:
             - containerPort: 8080
