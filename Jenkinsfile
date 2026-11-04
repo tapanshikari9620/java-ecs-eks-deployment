@@ -7,14 +7,15 @@ pipeline {
     }
 
     environment {
-        JAVA_HOME = '/usr/lib/jvm/java-17-openjdk-amd64'
-        PATH = "${JAVA_HOME}/bin:/usr/share/maven/bin:${env.PATH}"
+        AWS_REGION       = 'us-east-1'
+        ECR_REPOSITORY   = 'java-demo-app'
+        EKS_CLUSTER_NAME = 'java-demo-eks'
+        IMAGE_NAME       = 'java-demo-app'
 
-        ACR_LOGIN_SERVER = 'javademoacr99.azurecr.io'
-        IMAGE_NAME = 'java-demo-app'
-        CONTAINER_APP_NAME = 'java-demo-app'
-        RESOURCE_GROUP = '1-71e9e42f-playground-sandbox'
-        AZURE_LOCATION = 'eastus'
+        // Java 17 for building your Spring Boot application
+        JAVA17_HOME = '/usr/lib/jvm/java-17-amazon-corretto'
+
+        PATH = "${JAVA17_HOME}/bin:/usr/share/maven/bin:${env.PATH}"
     }
 
     stages {
@@ -27,9 +28,20 @@ pipeline {
         stage('Verify Tools') {
             steps {
                 sh '''
-                    java --version
+                    echo "Java version:"
+                    java -version
+
+                    echo "Maven version:"
                     mvn --version
+
+                    echo "Docker version:"
                     docker --version
+
+                    echo "AWS CLI version:"
+                    aws --version
+
+                    echo "kubectl version:"
+                    kubectl version --client
                 '''
             }
         }
@@ -42,8 +54,10 @@ pipeline {
 
         stage('Build Java Application') {
             steps {
-                sh 'mvn clean package -DskipTests'
-                sh 'test -f target/java-demo-app.jar'
+                sh '''
+                    mvn clean package -DskipTests
+                    test -f target/java-demo-app.jar
+                '''
             }
         }
 
@@ -57,87 +71,92 @@ pipeline {
             }
         }
 
-        stage('Push Image to ACR') {
+        stage('Login to Amazon ECR') {
             steps {
-                withCredentials([
-                    usernamePassword(
-                        credentialsId: 'azure-acr-credentials',
-                        usernameVariable: 'ACR_USERNAME',
-                        passwordVariable: 'ACR_PASSWORD'
-                    )
-                ]) {
-                    sh '''
-                        set +x
-                        echo "$ACR_PASSWORD" | docker login \
-                          "$ACR_LOGIN_SERVER" \
-                          --username "$ACR_USERNAME" \
-                          --password-stdin
+                sh '''
+                    AWS_ACCOUNT_ID=$(aws sts get-caller-identity \
+                      --query Account \
+                      --output text)
 
-                        docker tag "${IMAGE_NAME}:${BUILD_NUMBER}" \
-                          "${ACR_LOGIN_SERVER}/${IMAGE_NAME}:${BUILD_NUMBER}"
+                    ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
 
-                        docker tag "${IMAGE_NAME}:${BUILD_NUMBER}" \
-                          "${ACR_LOGIN_SERVER}/${IMAGE_NAME}:latest"
-
-                        docker push "${ACR_LOGIN_SERVER}/${IMAGE_NAME}:${BUILD_NUMBER}"
-                        docker push "${ACR_LOGIN_SERVER}/${IMAGE_NAME}:latest"
-
-                        docker logout "$ACR_LOGIN_SERVER"
-                    '''
-                }
+                    aws ecr get-login-password --region "${AWS_REGION}" \
+                      | docker login \
+                          --username AWS \
+                          --password-stdin "${ECR_REGISTRY}"
+                '''
             }
         }
 
-        stage('Deploy to Azure Container Apps') {
+        stage('Push Image to ECR') {
             steps {
-                withCredentials([
-                    usernamePassword(
-                        credentialsId: 'azure-acr-credentials',
-                        usernameVariable: 'ACR_USERNAME',
-                        passwordVariable: 'ACR_PASSWORD'
-                    )
-                ]) {
-                    sh '''
-                        set +x
+                sh '''
+                    AWS_ACCOUNT_ID=$(aws sts get-caller-identity \
+                      --query Account \
+                      --output text)
 
-                        # Authenticate Azure CLI using a service principal
-                        # stored in Jenkins credentials.
-                        az login \
-                          --service-principal \
-                          --username "$AZURE_CLIENT_ID" \
-                          --password "$AZURE_CLIENT_SECRET" \
-                          --tenant "$AZURE_TENANT_ID"
+                    ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
 
-                        az account set --subscription "$AZURE_SUBSCRIPTION_ID"
+                    docker tag "${IMAGE_NAME}:${BUILD_NUMBER}" \
+                      "${ECR_REGISTRY}/${ECR_REPOSITORY}:${BUILD_NUMBER}"
 
-                        # Update the existing Container App to the new image.
-                        az containerapp update \
-                          --name "$CONTAINER_APP_NAME" \
-                          --resource-group "$RESOURCE_GROUP" \
-                          --image "${ACR_LOGIN_SERVER}/${IMAGE_NAME}:${BUILD_NUMBER}"
+                    docker tag "${IMAGE_NAME}:${BUILD_NUMBER}" \
+                      "${ECR_REGISTRY}/${ECR_REPOSITORY}:latest"
 
-                        az logout
-                    '''
-                }
+                    docker push "${ECR_REGISTRY}/${ECR_REPOSITORY}:${BUILD_NUMBER}"
+                    docker push "${ECR_REGISTRY}/${ECR_REPOSITORY}:latest"
+                '''
+            }
+        }
+
+        stage('Configure kubectl for EKS') {
+            steps {
+                sh '''
+                    aws eks update-kubeconfig \
+                      --region "${AWS_REGION}" \
+                      --name "${EKS_CLUSTER_NAME}"
+
+                    kubectl get nodes
+                '''
+            }
+        }
+
+        stage('Deploy to EKS') {
+            steps {
+                sh '''
+                    AWS_ACCOUNT_ID=$(aws sts get-caller-identity \
+                      --query Account \
+                      --output text)
+
+                    ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+                    IMAGE_URI="${ECR_REGISTRY}/${ECR_REPOSITORY}:${BUILD_NUMBER}"
+
+                    # Update the image in the Kubernetes Deployment
+                    kubectl set image deployment/java-demo-app \
+                      java-demo-app="${IMAGE_URI}" \
+                      --namespace default
+
+                    kubectl rollout status deployment/java-demo-app \
+                      --namespace default \
+                      --timeout=180s
+                '''
             }
         }
     }
 
     post {
         success {
-            echo "Build ${BUILD_NUMBER} completed and deployment was requested."
+            echo "Build ${BUILD_NUMBER} completed successfully and deployed to EKS."
         }
 
         failure {
-            echo 'Pipeline failed. Review Console Output and fix the failing stage.'
+            echo 'Pipeline failed. Check the Console Output for the failing stage.'
         }
 
         always {
             sh '''
                 docker image rm "${IMAGE_NAME}:${BUILD_NUMBER}" 2>/dev/null || true
                 docker image rm "${IMAGE_NAME}:latest" 2>/dev/null || true
-                docker image rm "${ACR_LOGIN_SERVER}/${IMAGE_NAME}:${BUILD_NUMBER}" 2>/dev/null || true
-                docker image rm "${ACR_LOGIN_SERVER}/${IMAGE_NAME}:latest" 2>/dev/null || true
             '''
         }
     }
